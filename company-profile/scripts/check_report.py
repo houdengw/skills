@@ -35,16 +35,22 @@ BANNED_URL_HINTS = (
 
 # 表示推断或综合判断的词，带这些词的无引用句子不报警
 INFERENCE_HINTS = ("判断", "推断", "可见", "说明", "意味着", "反映", "表明", "看来", "综合", "见第", "详见",
-                   "未检索到", "未披露", "未找到", "未查到", "待核实", "已查")
+                   "未检索到", "未披露", "未找到", "未查到", "未见", "未经", "待核实", "已查", "可查", "建议")
 
 # 定性评价用语，必须有出处并写明是谁的评价
 EVALUATIVE_WORDS = ("第一梯队", "领先", "龙头", "头部", "标杆", "领军", "首家", "唯一", "最大", "第一",
                     "顶尖", "一流", "知名", "突出", "卓越", "罕见", "护城河", "壁垒")
 
+SUMMARY_SECTIONS = ("核心结论", "冲突")
+
+# note 以这些前缀开头时，在参考来源中标出原文状态
+SOURCE_STATUS = (("仅摘要", "摘录为搜索摘要"), ("标题原文", "仅取得标题"))
+
 CITE_RE = re.compile(r"\[(E\d{3,})\]")
 CALC_RE = re.compile(r"[（(]\s*计算[：:].*?[）)]")
-UNIT_SCALE = {"万亿": 1e12, "亿": 1e8, "千万": 1e7, "百万": 1e6, "万": 1e4, "千": 1e3}
-NUM_RE = re.compile(r"(?<![\d.])(\d[\d,]*(?:\.\d+)?)\s*(万亿|亿|千万|百万|万|千|%|％)?")
+UNIT_SCALE = {"万亿": 1e12, "亿": 1e8, "千万": 1e7, "百万": 1e6, "万": 1e4, "千": 1e3,
+              "trillion": 1e12, "billion": 1e9, "million": 1e6}
+NUM_RE = re.compile(r"(?<![\d.])(\d[\d,]*(?:\.\d+)?)\s*(万亿|亿|千万|百万|万|千|%|％|trillion|billion|million)?", re.I)
 
 # 先从文本中剔除这些片段，再提取数字：日期、股票代码、字母数字混合的型号名、列表序号
 STRIP_PATTERNS = [
@@ -95,13 +101,14 @@ def load_evidence(path):
             if hint in url:
                 errors.append(f"{where}（{eid}）：URL 含「{hint}」，疑似 AI 生成内容，不能作为证据")
                 break
-        if not item["date"].strip() and item["entity"] != "rejected":
-            warns.append(f"{where}（{eid}）：缺少发布日期，读者无法判断时效")
+        if not item["date"].strip() and not item.get("accessed", "").strip() and item["entity"] != "rejected":
+            warns.append(f"{where}（{eid}）：缺少发布日期；持续更新的页面（工商平台、代码仓库）请填 accessed 访问日期")
         ev[eid] = item
     return ev, errors, warns
 
 
 def to_value(num, unit):
+    unit = unit.lower() if unit else unit
     v = float(num.replace(",", ""))
     if unit in ("%", "％"):
         return v, "%"
@@ -113,6 +120,7 @@ def tolerance(num, unit):
     s = num.replace(",", "")
     decimals = len(s.split(".")[1]) if "." in s else 0
     step = 0.5 * 10 ** (-decimals)
+    unit = unit.lower() if unit else unit
     if unit in ("%", "％"):
         return step
     return step * UNIT_SCALE.get(unit or "", 1)
@@ -181,6 +189,14 @@ def split_draft(text):
             continue
         # 普通段落：按句末标点切句，句末标点后紧跟的引用归前一句
         parts = re.split(r"(?<=[。！？；])", line)
+        # 句号落在加粗引导语里（**结论。**）时，引导语和后一句合并
+        joined = []
+        for p in parts:
+            if joined and joined[-1].count("**") % 2 == 1:
+                joined[-1] += p
+            else:
+                joined.append(p)
+        parts = joined
         merged = []
         for p in parts:
             lead = re.match(r"^\s*((?:\[E\d{3,}\])+)", p)
@@ -260,6 +276,8 @@ def check(workdir):
             warns.append(f"{where}：关键数字只有 T4 来源支撑，需找 T1–T3 来源或标注【待核实】")
 
     for key, secs in value_sections.items():
+        # 核心结论是摘要，冲突一节需要并列各方数字，都不计入重复
+        secs = {k: v for k, v in secs.items() if not any(w in k for w in SUMMARY_SECTIONS)}
         if len(secs) >= 3 and key[0] >= 10:
             sample = next(iter(secs.values()))
             warns.append(f"数字「{sample}」出现在 {len(secs)} 个章节（{'、'.join(secs)}），检查是否跨章节重复叙述")
@@ -305,13 +323,16 @@ def render(workdir, ev, with_quotes):
             "T3 行业媒体与研究机构；T4 自媒体、百科、论坛等。", ""]
     for eid in order:
         it = ev[eid]
-        date = f"，{it['date']}" if it["date"] else ""
+        date = f"，{it['date']}" if it["date"] else (f"，访问于 {it['accessed']}" if it.get("accessed") else "")
         loc = f"，{it['locator']}" if it.get("locator") else ""
-        line = f"[{num[eid]}] {it['publisher']}：{it['title']}（{it['tier']}{date}{loc}）{it['url']}"
+        note = it.get("note", "")
+        status = next((f"，{tag}" for key, tag in SOURCE_STATUS if note.startswith(key)), "")
+        line = f"[{num[eid]}] {it['publisher']}：{it['title']}（{it['tier']}{date}{loc}{status}）{it['url']}"
         if with_quotes:
             q = it["quote"].strip().replace("\n", " ")
             q = q if len(q) <= 90 else q[:90] + "…"
-            line += f"  \n    原文摘录：「{q}」"
+            label = "摘要" if note.startswith("仅摘要") else "原文摘录"
+            line += f"  \n    {label}：「{q}」"
         refs.append(line)
     (workdir / "report.md").write_text(out.rstrip() + "\n" + "\n".join(refs) + "\n", encoding="utf-8")
     print(f"已生成 {workdir / 'report.md'}（{stats}）")
